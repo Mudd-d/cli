@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/cli/cli/api"
-	"github.com/cli/cli/pkg/iostreams"
+	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/pkg/iostreams"
 )
 
 type metadataStateType int
@@ -18,17 +18,20 @@ const (
 type IssueMetadataState struct {
 	Type metadataStateType
 
-	Draft bool
+	Draft          bool
+	ActorAssignees bool
 
 	Body  string
 	Title string
 
-	Metadata   []string
-	Reviewers  []string
-	Assignees  []string
-	Labels     []string
-	Projects   []string
-	Milestones []string
+	Template string
+
+	Metadata      []string
+	Reviewers     []string
+	Assignees     []string
+	Labels        []string
+	ProjectTitles []string
+	Milestones    []string
 
 	MetadataResult *api.RepoMetadataResult
 
@@ -47,7 +50,7 @@ func (tb *IssueMetadataState) HasMetadata() bool {
 	return len(tb.Reviewers) > 0 ||
 		len(tb.Assignees) > 0 ||
 		len(tb.Labels) > 0 ||
-		len(tb.Projects) > 0 ||
+		len(tb.ProjectTitles) > 0 ||
 		len(tb.Milestones) > 0
 }
 
