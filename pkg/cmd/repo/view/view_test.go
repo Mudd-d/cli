@@ -7,14 +7,91 @@ import (
 	"testing"
 
 	"github.com/MakeNowJust/heredoc"
-	"github.com/cli/cli/internal/ghrepo"
-	"github.com/cli/cli/internal/run"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/httpmock"
-	"github.com/cli/cli/pkg/iostreams"
+	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/internal/browser"
+	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/internal/gh"
+	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/internal/run"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/httpmock"
+	"github.com/cli/cli/v2/pkg/iostreams"
+	"github.com/cli/cli/v2/pkg/jsonfieldstest"
 	"github.com/google/shlex"
 	"github.com/stretchr/testify/assert"
 )
+
+func TestJSONFields(t *testing.T) {
+	jsonfieldstest.ExpectCommandToSupportJSONFields(t, NewCmdView, []string{
+		"archivedAt",
+		"assignableUsers",
+		"codeOfConduct",
+		"contactLinks",
+		"createdAt",
+		"defaultBranchRef",
+		"deleteBranchOnMerge",
+		"description",
+		"diskUsage",
+		"forkCount",
+		"fundingLinks",
+		"hasDiscussionsEnabled",
+		"hasIssuesEnabled",
+		"hasProjectsEnabled",
+		"hasWikiEnabled",
+		"homepageUrl",
+		"id",
+		"isArchived",
+		"isBlankIssuesEnabled",
+		"isEmpty",
+		"isFork",
+		"isInOrganization",
+		"isMirror",
+		"isPrivate",
+		"isSecurityPolicyEnabled",
+		"isTemplate",
+		"isUserConfigurationRepository",
+		"issueTemplates",
+		"issues",
+		"labels",
+		"languages",
+		"latestRelease",
+		"licenseInfo",
+		"mentionableUsers",
+		"mergeCommitAllowed",
+		"milestones",
+		"mirrorUrl",
+		"name",
+		"nameWithOwner",
+		"openGraphImageUrl",
+		"owner",
+		"parent",
+		"primaryLanguage",
+		"projects",
+		"projectsV2",
+		"pullRequestTemplates",
+		"pullRequests",
+		"pushedAt",
+		"rebaseMergeAllowed",
+		"repositoryTopics",
+		"securityPolicyUrl",
+		"sshUrl",
+		"squashMergeAllowed",
+		"stargazerCount",
+		"templateRepository",
+		"updatedAt",
+		"url",
+		"usesCustomOpenGraphImage",
+		"viewerCanAdminister",
+		"viewerDefaultCommitEmail",
+		"viewerDefaultMergeMethod",
+		"viewerHasStarred",
+		"viewerPermission",
+		"viewerPossibleCommitEmails",
+		"viewerSubscription",
+		"visibility",
+		"watchers",
+	})
+}
 
 func TestNewCmdView(t *testing.T) {
 	tests := []struct {
@@ -104,7 +181,7 @@ func Test_RepoView_Web(t *testing.T) {
 		{
 			name:       "tty",
 			stdoutTTY:  true,
-			wantStderr: "Opening github.com/OWNER/REPO in your browser.\n",
+			wantStderr: "Opening https://github.com/OWNER/REPO in your browser.\n",
 			wantBrowse: "https://github.com/OWNER/REPO",
 		},
 		{
@@ -119,7 +196,7 @@ func Test_RepoView_Web(t *testing.T) {
 		reg := &httpmock.Registry{}
 		reg.StubRepoInfoResponse("OWNER", "REPO", "main")
 
-		browser := &cmdutil.TestBrowser{}
+		browser := &browser.Stub{}
 		opts := &ViewOptions{
 			Web: true,
 			HttpClient: func() (*http.Client, error) {
@@ -527,6 +604,9 @@ func Test_ViewRun_WithoutUsername(t *testing.T) {
 			return &http.Client{Transport: reg}, nil
 		},
 		IO: io,
+		Config: func() (gh.Config, error) {
+			return config.NewMockConfig(), nil
+		},
 	}
 
 	if err := viewRun(opts); err != nil {
@@ -624,4 +704,52 @@ func Test_ViewRun_HandlesSpecialCharacters(t *testing.T) {
 			reg.Verify(t)
 		})
 	}
+}
+
+func Test_viewRun_json(t *testing.T) {
+	io, _, stdout, stderr := iostreams.Test()
+	io.SetStdoutTTY(false)
+
+	reg := &httpmock.Registry{}
+	defer reg.Verify(t)
+	reg.StubRepoInfoResponse("OWNER", "REPO", "main")
+
+	opts := &ViewOptions{
+		IO: io,
+		HttpClient: func() (*http.Client, error) {
+			return &http.Client{Transport: reg}, nil
+		},
+		BaseRepo: func() (ghrepo.Interface, error) {
+			return ghrepo.New("OWNER", "REPO"), nil
+		},
+		Exporter: &testExporter{
+			fields: []string{"name", "defaultBranchRef"},
+		},
+	}
+
+	_, teardown := run.Stub()
+	defer teardown(t)
+
+	err := viewRun(opts)
+	assert.NoError(t, err)
+	assert.Equal(t, heredoc.Doc(`
+		name: REPO
+		defaultBranchRef: main
+	`), stdout.String())
+	assert.Equal(t, "", stderr.String())
+}
+
+type testExporter struct {
+	fields []string
+}
+
+func (e *testExporter) Fields() []string {
+	return e.fields
+}
+
+func (e *testExporter) Write(io *iostreams.IOStreams, data any) error {
+	r := data.(*api.Repository)
+	fmt.Fprintf(io.Out, "name: %s\n", r.Name)
+	fmt.Fprintf(io.Out, "defaultBranchRef: %s\n", r.DefaultBranchRef.Name)
+	return nil
 }

@@ -4,20 +4,27 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
-	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/MakeNowJust/heredoc"
-	"github.com/cli/cli/git"
-	"github.com/cli/cli/internal/config"
-	"github.com/cli/cli/internal/ghrepo"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/iostreams"
+	rootapi "github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/git"
+	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/internal/gh"
+	"github.com/cli/cli/v2/internal/gh/ghtelemetry"
+	ghmock "github.com/cli/cli/v2/internal/gh/mock"
+	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/internal/telemetry"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/iostreams"
+	"github.com/cli/go-gh/v2/pkg/template"
 	"github.com/google/shlex"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -50,6 +57,7 @@ func Test_NewCmdApi(t *testing.T) {
 				CacheTTL:            0,
 				Template:            "",
 				FilterOutput:        "",
+				Verbose:             false,
 			},
 			wantsErr: false,
 		},
@@ -71,6 +79,7 @@ func Test_NewCmdApi(t *testing.T) {
 				CacheTTL:            0,
 				Template:            "",
 				FilterOutput:        "",
+				Verbose:             false,
 			},
 			wantsErr: false,
 		},
@@ -92,6 +101,7 @@ func Test_NewCmdApi(t *testing.T) {
 				CacheTTL:            0,
 				Template:            "",
 				FilterOutput:        "",
+				Verbose:             false,
 			},
 			wantsErr: false,
 		},
@@ -113,6 +123,7 @@ func Test_NewCmdApi(t *testing.T) {
 				CacheTTL:            0,
 				Template:            "",
 				FilterOutput:        "",
+				Verbose:             false,
 			},
 			wantsErr: false,
 		},
@@ -134,6 +145,7 @@ func Test_NewCmdApi(t *testing.T) {
 				CacheTTL:            0,
 				Template:            "",
 				FilterOutput:        "",
+				Verbose:             false,
 			},
 			wantsErr: false,
 		},
@@ -155,6 +167,7 @@ func Test_NewCmdApi(t *testing.T) {
 				CacheTTL:            0,
 				Template:            "",
 				FilterOutput:        "",
+				Verbose:             false,
 			},
 			wantsErr: false,
 		},
@@ -181,6 +194,7 @@ func Test_NewCmdApi(t *testing.T) {
 				CacheTTL:            0,
 				Template:            "",
 				FilterOutput:        "",
+				Verbose:             false,
 			},
 			wantsErr: false,
 		},
@@ -207,6 +221,7 @@ func Test_NewCmdApi(t *testing.T) {
 				CacheTTL:            0,
 				Template:            "",
 				FilterOutput:        "",
+				Verbose:             false,
 			},
 			wantsErr: false,
 		},
@@ -233,6 +248,7 @@ func Test_NewCmdApi(t *testing.T) {
 				CacheTTL:            0,
 				Template:            "",
 				FilterOutput:        "",
+				Verbose:             false,
 			},
 			wantsErr: false,
 		},
@@ -254,6 +270,7 @@ func Test_NewCmdApi(t *testing.T) {
 				CacheTTL:            time.Minute * 5,
 				Template:            "",
 				FilterOutput:        "",
+				Verbose:             false,
 			},
 			wantsErr: false,
 		},
@@ -275,6 +292,7 @@ func Test_NewCmdApi(t *testing.T) {
 				CacheTTL:            0,
 				Template:            "hello {{.name}}",
 				FilterOutput:        "",
+				Verbose:             false,
 			},
 			wantsErr: false,
 		},
@@ -296,6 +314,7 @@ func Test_NewCmdApi(t *testing.T) {
 				CacheTTL:            0,
 				Template:            "",
 				FilterOutput:        ".name",
+				Verbose:             false,
 			},
 			wantsErr: false,
 		},
@@ -313,6 +332,43 @@ func Test_NewCmdApi(t *testing.T) {
 			name:     "--jq with --template",
 			cli:      "user --jq .foo -t '{{.foo}}'",
 			wantsErr: true,
+		},
+		{
+			name:     "--slurp without --paginate",
+			cli:      "user --slurp",
+			wantsErr: true,
+		},
+		{
+			name:     "slurp with --jq",
+			cli:      "user --paginate --slurp --jq .foo",
+			wantsErr: true,
+		},
+		{
+			name:     "slurp with --template",
+			cli:      "user --paginate --slurp --template '{{.foo}}'",
+			wantsErr: true,
+		},
+		{
+			name: "with verbose",
+			cli:  "user --verbose",
+			wants: ApiOptions{
+				Hostname:            "",
+				RequestMethod:       "GET",
+				RequestMethodPassed: false,
+				RequestPath:         "user",
+				RequestInputFile:    "",
+				RawFields:           []string(nil),
+				MagicFields:         []string(nil),
+				RequestHeaders:      []string(nil),
+				ShowResponseHeaders: false,
+				Paginate:            false,
+				Silent:              false,
+				CacheTTL:            0,
+				Template:            "",
+				FilterOutput:        "",
+				Verbose:             true,
+			},
+			wantsErr: false,
 		},
 	}
 	for _, tt := range tests {
@@ -350,8 +406,52 @@ func Test_NewCmdApi(t *testing.T) {
 			assert.Equal(t, tt.wants.CacheTTL, opts.CacheTTL)
 			assert.Equal(t, tt.wants.Template, opts.Template)
 			assert.Equal(t, tt.wants.FilterOutput, opts.FilterOutput)
+			assert.Equal(t, tt.wants.Verbose, opts.Verbose)
 		})
 	}
+}
+
+func Test_NewCmdApi_WindowsAbsPath(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.SkipNow()
+	}
+
+	cmd := NewCmdApi(&cmdutil.Factory{}, func(opts *ApiOptions) error {
+		return nil
+	})
+
+	cmd.SetArgs([]string{`C:\users\repos`})
+	_, err := cmd.ExecuteC()
+	assert.EqualError(t, err, `invalid API endpoint: "C:\users\repos". Your shell might be rewriting URL paths as filesystem paths. To avoid this, omit the leading slash from the endpoint argument`)
+}
+
+func TestNewCmdApiTelemetry(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, "{}")
+	}))
+	t.Cleanup(server.Close)
+
+	var payload telemetry.SendTelemetryPayload
+	recorder := telemetry.NewService(func(p telemetry.SendTelemetryPayload) {
+		payload = p
+	})
+	recorder.Record(ghtelemetry.Event{Type: "command"})
+
+	ios, _, _, _ := iostreams.Test()
+	f := &cmdutil.Factory{
+		Config:            func() (gh.Config, error) { return config.NewMockConfig(), nil },
+		IOStreams:         ios,
+		TelemetryDisabler: recorder,
+	}
+	cmd := NewCmdApi(f, nil)
+	cmd.SetArgs([]string{server.URL})
+
+	_, err := cmd.ExecuteC()
+	require.NoError(t, err)
+	recorder.Finish()
+
+	assert.Empty(t, payload.Events)
 }
 
 func Test_apiRun(t *testing.T) {
@@ -360,18 +460,21 @@ func Test_apiRun(t *testing.T) {
 		options      ApiOptions
 		httpResponse *http.Response
 		err          error
+		errMsg       string
 		stdout       string
 		stderr       string
+		isatty       bool
 	}{
 		{
 			name: "success",
 			httpResponse: &http.Response{
 				StatusCode: 200,
-				Body:       ioutil.NopCloser(bytes.NewBufferString(`bam!`)),
+				Body:       io.NopCloser(bytes.NewBufferString(`bam!`)),
 			},
 			err:    nil,
 			stdout: `bam!`,
 			stderr: ``,
+			isatty: false,
 		},
 		{
 			name: "show response headers",
@@ -382,12 +485,13 @@ func Test_apiRun(t *testing.T) {
 				Proto:      "HTTP/1.1",
 				Status:     "200 Okey-dokey",
 				StatusCode: 200,
-				Body:       ioutil.NopCloser(bytes.NewBufferString(`body`)),
+				Body:       io.NopCloser(bytes.NewBufferString(`body`)),
 				Header:     http.Header{"Content-Type": []string{"text/plain"}},
 			},
 			err:    nil,
 			stdout: "HTTP/1.1 200 Okey-dokey\nContent-Type: text/plain\r\n\r\nbody",
 			stderr: ``,
+			isatty: false,
 		},
 		{
 			name: "success 204",
@@ -398,28 +502,31 @@ func Test_apiRun(t *testing.T) {
 			err:    nil,
 			stdout: ``,
 			stderr: ``,
+			isatty: false,
 		},
 		{
 			name: "REST error",
 			httpResponse: &http.Response{
 				StatusCode: 400,
-				Body:       ioutil.NopCloser(bytes.NewBufferString(`{"message": "THIS IS FINE"}`)),
+				Body:       io.NopCloser(bytes.NewBufferString(`{"message": "THIS IS FINE"}`)),
 				Header:     http.Header{"Content-Type": []string{"application/json; charset=utf-8"}},
 			},
 			err:    cmdutil.SilentError,
 			stdout: `{"message": "THIS IS FINE"}`,
 			stderr: "gh: THIS IS FINE (HTTP 400)\n",
+			isatty: false,
 		},
 		{
 			name: "REST string errors",
 			httpResponse: &http.Response{
 				StatusCode: 400,
-				Body:       ioutil.NopCloser(bytes.NewBufferString(`{"errors": ["ALSO", "FINE"]}`)),
+				Body:       io.NopCloser(bytes.NewBufferString(`{"errors": ["ALSO", "FINE"]}`)),
 				Header:     http.Header{"Content-Type": []string{"application/json; charset=utf-8"}},
 			},
 			err:    cmdutil.SilentError,
 			stdout: `{"errors": ["ALSO", "FINE"]}`,
 			stderr: "gh: ALSO\nFINE\n",
+			isatty: false,
 		},
 		{
 			name: "GraphQL error",
@@ -428,22 +535,24 @@ func Test_apiRun(t *testing.T) {
 			},
 			httpResponse: &http.Response{
 				StatusCode: 200,
-				Body:       ioutil.NopCloser(bytes.NewBufferString(`{"errors": [{"message":"AGAIN"}, {"message":"FINE"}]}`)),
+				Body:       io.NopCloser(bytes.NewBufferString(`{"errors": [{"message":"AGAIN"}, {"message":"FINE"}]}`)),
 				Header:     http.Header{"Content-Type": []string{"application/json; charset=utf-8"}},
 			},
 			err:    cmdutil.SilentError,
 			stdout: `{"errors": [{"message":"AGAIN"}, {"message":"FINE"}]}`,
 			stderr: "gh: AGAIN\nFINE\n",
+			isatty: false,
 		},
 		{
 			name: "failure",
 			httpResponse: &http.Response{
 				StatusCode: 502,
-				Body:       ioutil.NopCloser(bytes.NewBufferString(`gateway timeout`)),
+				Body:       io.NopCloser(bytes.NewBufferString(`gateway timeout`)),
 			},
 			err:    cmdutil.SilentError,
 			stdout: `gateway timeout`,
 			stderr: "gh: HTTP 502\n",
+			isatty: false,
 		},
 		{
 			name: "silent",
@@ -452,11 +561,12 @@ func Test_apiRun(t *testing.T) {
 			},
 			httpResponse: &http.Response{
 				StatusCode: 200,
-				Body:       ioutil.NopCloser(bytes.NewBufferString(`body`)),
+				Body:       io.NopCloser(bytes.NewBufferString(`body`)),
 			},
 			err:    nil,
 			stdout: ``,
 			stderr: ``,
+			isatty: false,
 		},
 		{
 			name: "show response headers even when silent",
@@ -468,12 +578,13 @@ func Test_apiRun(t *testing.T) {
 				Proto:      "HTTP/1.1",
 				Status:     "200 Okey-dokey",
 				StatusCode: 200,
-				Body:       ioutil.NopCloser(bytes.NewBufferString(`body`)),
+				Body:       io.NopCloser(bytes.NewBufferString(`body`)),
 				Header:     http.Header{"Content-Type": []string{"text/plain"}},
 			},
 			err:    nil,
 			stdout: "HTTP/1.1 200 Okey-dokey\nContent-Type: text/plain\r\n\r\n",
 			stderr: ``,
+			isatty: false,
 		},
 		{
 			name: "output template",
@@ -482,12 +593,56 @@ func Test_apiRun(t *testing.T) {
 			},
 			httpResponse: &http.Response{
 				StatusCode: 200,
-				Body:       ioutil.NopCloser(bytes.NewBufferString(`{"status":"not a cat"}`)),
+				Body:       io.NopCloser(bytes.NewBufferString(`{"status":"not a cat"}`)),
 				Header:     http.Header{"Content-Type": []string{"application/json"}},
 			},
 			err:    nil,
 			stdout: "not a cat",
 			stderr: ``,
+			isatty: false,
+		},
+		{
+			name: "output template with range",
+			options: ApiOptions{
+				Template: `{{range .}}{{.title}} ({{.labels | pluck "name" | join ", " }}){{"\n"}}{{end}}`,
+			},
+			httpResponse: &http.Response{
+				StatusCode: 200,
+				Body: io.NopCloser(bytes.NewBufferString(`[
+					{
+						"title": "First title",
+						"labels": [{"name":"bug"}, {"name":"help wanted"}]
+					},
+					{
+						"title": "Second but not last"
+					},
+					{
+						"title": "Alas, tis' the end",
+						"labels": [{}, {"name":"feature"}]
+					}
+				]`)),
+				Header: http.Header{"Content-Type": []string{"application/json"}},
+			},
+			stdout: heredoc.Doc(`
+			First title (bug, help wanted)
+			Second but not last ()
+			Alas, tis' the end (, feature)
+		`),
+		},
+		{
+			name: "output template when REST error",
+			options: ApiOptions{
+				Template: `{{.status}}`,
+			},
+			httpResponse: &http.Response{
+				StatusCode: 400,
+				Body:       io.NopCloser(bytes.NewBufferString(`{"message": "THIS IS FINE"}`)),
+				Header:     http.Header{"Content-Type": []string{"application/json; charset=utf-8"}},
+			},
+			err:    cmdutil.SilentError,
+			stdout: `{"message": "THIS IS FINE"}`,
+			stderr: "gh: THIS IS FINE (HTTP 400)\n",
+			isatty: false,
 		},
 		{
 			name: "jq filter",
@@ -496,22 +651,129 @@ func Test_apiRun(t *testing.T) {
 			},
 			httpResponse: &http.Response{
 				StatusCode: 200,
-				Body:       ioutil.NopCloser(bytes.NewBufferString(`[{"name":"Mona"},{"name":"Hubot"}]`)),
+				Body:       io.NopCloser(bytes.NewBufferString(`[{"name":"Mona"},{"name":"Hubot"}]`)),
 				Header:     http.Header{"Content-Type": []string{"application/json"}},
 			},
 			err:    nil,
 			stdout: "Mona\nHubot\n",
 			stderr: ``,
+			isatty: false,
+		},
+		{
+			name: "jq filter when REST error",
+			options: ApiOptions{
+				FilterOutput: `.[].name`,
+			},
+			httpResponse: &http.Response{
+				StatusCode: 400,
+				Body:       io.NopCloser(bytes.NewBufferString(`{"message": "THIS IS FINE"}`)),
+				Header:     http.Header{"Content-Type": []string{"application/json; charset=utf-8"}},
+			},
+			err:    cmdutil.SilentError,
+			stdout: `{"message": "THIS IS FINE"}`,
+			stderr: "gh: THIS IS FINE (HTTP 400)\n",
+			isatty: false,
+		},
+		{
+			name: "jq filter outputting JSON to a TTY",
+			options: ApiOptions{
+				FilterOutput: `.`,
+			},
+			httpResponse: &http.Response{
+				StatusCode: 200,
+				Body:       io.NopCloser(bytes.NewBufferString(`[{"name":"Mona"},{"name":"Hubot"}]`)),
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+			},
+			err:    nil,
+			stdout: "[\n  {\n    \"name\": \"Mona\"\n  },\n  {\n    \"name\": \"Hubot\"\n  }\n]\n",
+			stderr: ``,
+			isatty: true,
+		},
+		{
+			name: "refuses escape sequences in non-JSON body on a TTY",
+			httpResponse: &http.Response{
+				StatusCode: 200,
+				Body:       io.NopCloser(bytes.NewBufferString("\x1b[31mred\x1b[m")),
+				Header:     http.Header{"Content-Type": []string{"text/plain"}},
+			},
+			errMsg: "the response contains terminal escape sequences; pass --allow-escape-sequences to output it anyway",
+			stdout: ``,
+			stderr: ``,
+			isatty: true,
+		},
+		{
+			name: "passes escape sequences through with --allow-escape-sequences on a TTY",
+			options: ApiOptions{
+				AllowEscapeSequences: true,
+			},
+			httpResponse: &http.Response{
+				StatusCode: 200,
+				Body:       io.NopCloser(bytes.NewBufferString("\x1b[31mred\x1b[m")),
+				Header:     http.Header{"Content-Type": []string{"text/plain"}},
+			},
+			err:    nil,
+			stdout: "\x1b[31mred\x1b[m",
+			stderr: ``,
+			isatty: true,
+		},
+		{
+			name: "refuses escape sequences in non-JSON body when piped",
+			httpResponse: &http.Response{
+				StatusCode: 200,
+				Body:       io.NopCloser(bytes.NewBufferString("\x1b[31mred\x1b[m")),
+				Header:     http.Header{"Content-Type": []string{"text/plain"}},
+			},
+			errMsg: "the response contains terminal escape sequences; pass --allow-escape-sequences to output it anyway",
+			stdout: ``,
+			stderr: ``,
+			isatty: false,
+		},
+		{
+			name: "outputs clean non-JSON text on a TTY",
+			httpResponse: &http.Response{
+				StatusCode: 200,
+				Body:       io.NopCloser(bytes.NewBufferString("plain readme text\n")),
+				Header:     http.Header{"Content-Type": []string{"text/plain"}},
+			},
+			err:    nil,
+			stdout: "plain readme text\n",
+			stderr: ``,
+			isatty: true,
+		},
+		{
+			name: "streams binary non-JSON body when piped",
+			httpResponse: &http.Response{
+				StatusCode: 200,
+				Body:       io.NopCloser(bytes.NewReader(append([]byte("\x89PNG\r\n\x1a\n"), make([]byte, 16)...))),
+				Header:     http.Header{"Content-Type": []string{"application/octet-stream"}},
+			},
+			err:    nil,
+			stdout: string(append([]byte("\x89PNG\r\n\x1a\n"), make([]byte, 16)...)),
+			stderr: ``,
+			isatty: false,
+		},
+		{
+			name: "refuses binary non-JSON body on a TTY",
+			httpResponse: &http.Response{
+				StatusCode: 200,
+				Body:       io.NopCloser(bytes.NewReader(append([]byte("\x89PNG\r\n\x1a\n"), make([]byte, 16)...))),
+				Header:     http.Header{"Content-Type": []string{"application/octet-stream"}},
+			},
+			errMsg: "refusing to output binary content (image/png) to the terminal; redirect or pipe stdout to save it, or pass --allow-escape-sequences to output it anyway",
+			stdout: ``,
+			stderr: ``,
+			isatty: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			io, _, stdout, stderr := iostreams.Test()
+			ios, _, stdout, stderr := iostreams.Test()
+			ios.SetStdoutTTY(tt.isatty)
 
-			tt.options.IO = io
-			tt.options.Config = func() (config.Config, error) { return config.NewBlankConfig(), nil }
-			tt.options.HttpClient = func() (*http.Client, error) {
+			tt.options.IO = ios
+			tt.options.Config = func() (gh.Config, error) { return config.NewMockConfig(), nil }
+			tt.options.HttpClient = func(rootapi.HTTPClientOptions) (*http.Client, error) {
 				var tr roundTripper = func(req *http.Request) (*http.Response, error) {
 					resp := tt.httpResponse
 					resp.Request = req
@@ -521,7 +783,11 @@ func Test_apiRun(t *testing.T) {
 			}
 
 			err := apiRun(&tt.options)
-			if err != tt.err {
+			if tt.errMsg != "" {
+				if err == nil || err.Error() != tt.errMsg {
+					t.Errorf("expected error %q, got %v", tt.errMsg, err)
+				}
+			} else if err != tt.err {
 				t.Errorf("expected error %v, got %v", tt.err, err)
 			}
 
@@ -536,34 +802,47 @@ func Test_apiRun(t *testing.T) {
 }
 
 func Test_apiRun_paginationREST(t *testing.T) {
-	io, _, stdout, stderr := iostreams.Test()
+	ios, _, stdout, stderr := iostreams.Test()
 
 	requestCount := 0
 	responses := []*http.Response{
 		{
+			Proto:      "HTTP/1.1",
+			Status:     "200 OK",
 			StatusCode: 200,
-			Body:       ioutil.NopCloser(bytes.NewBufferString(`{"page":1}`)),
+			Body:       io.NopCloser(bytes.NewBufferString(`{"page":1}`)),
 			Header: http.Header{
-				"Link": []string{`<https://api.github.com/repositories/1227/issues?page=2>; rel="next", <https://api.github.com/repositories/1227/issues?page=3>; rel="last"`},
+				"Content-Type":        []string{"application/json"},
+				"Link":                []string{`<https://api.github.com/repositories/1227/issues?page=2>; rel="next", <https://api.github.com/repositories/1227/issues?page=3>; rel="last"`},
+				"X-Github-Request-Id": []string{"1"},
 			},
 		},
 		{
+			Proto:      "HTTP/1.1",
+			Status:     "200 OK",
 			StatusCode: 200,
-			Body:       ioutil.NopCloser(bytes.NewBufferString(`{"page":2}`)),
+			Body:       io.NopCloser(bytes.NewBufferString(`{"page":2}`)),
 			Header: http.Header{
-				"Link": []string{`<https://api.github.com/repositories/1227/issues?page=3>; rel="next", <https://api.github.com/repositories/1227/issues?page=3>; rel="last"`},
+				"Content-Type":        []string{"application/json"},
+				"Link":                []string{`<https://api.github.com/repositories/1227/issues?page=3>; rel="next", <https://api.github.com/repositories/1227/issues?page=3>; rel="last"`},
+				"X-Github-Request-Id": []string{"2"},
 			},
 		},
 		{
+			Proto:      "HTTP/1.1",
+			Status:     "200 OK",
 			StatusCode: 200,
-			Body:       ioutil.NopCloser(bytes.NewBufferString(`{"page":3}`)),
-			Header:     http.Header{},
+			Body:       io.NopCloser(bytes.NewBufferString(`{"page":3}`)),
+			Header: http.Header{
+				"Content-Type":        []string{"application/json"},
+				"X-Github-Request-Id": []string{"3"},
+			},
 		},
 	}
 
 	options := ApiOptions{
-		IO: io,
-		HttpClient: func() (*http.Client, error) {
+		IO: ios,
+		HttpClient: func(rootapi.HTTPClientOptions) (*http.Client, error) {
 			var tr roundTripper = func(req *http.Request) (*http.Response, error) {
 				resp := responses[requestCount]
 				resp.Request = req
@@ -572,12 +851,15 @@ func Test_apiRun_paginationREST(t *testing.T) {
 			}
 			return &http.Client{Transport: tr}, nil
 		},
-		Config: func() (config.Config, error) {
-			return config.NewBlankConfig(), nil
+		Config: func() (gh.Config, error) {
+			return config.NewMockConfig(), nil
 		},
 
-		RequestPath: "issues",
-		Paginate:    true,
+		RequestMethod:       "GET",
+		RequestMethodPassed: true,
+		RequestPath:         "issues",
+		Paginate:            true,
+		RawFields:           []string{"per_page=50", "page=1"},
 	}
 
 	err := apiRun(&options)
@@ -586,22 +868,375 @@ func Test_apiRun_paginationREST(t *testing.T) {
 	assert.Equal(t, `{"page":1}{"page":2}{"page":3}`, stdout.String(), "stdout")
 	assert.Equal(t, "", stderr.String(), "stderr")
 
-	assert.Equal(t, "https://api.github.com/issues?per_page=100", responses[0].Request.URL.String())
+	assert.Equal(t, "https://api.github.com/issues?page=1&per_page=50", responses[0].Request.URL.String())
+	assert.Equal(t, "https://api.github.com/repositories/1227/issues?page=2", responses[1].Request.URL.String())
+	assert.Equal(t, "https://api.github.com/repositories/1227/issues?page=3", responses[2].Request.URL.String())
+}
+
+func Test_apiRun_arrayPaginationREST(t *testing.T) {
+	ios, _, stdout, stderr := iostreams.Test()
+	ios.SetStdoutTTY(false)
+
+	requestCount := 0
+	responses := []*http.Response{
+		{
+			StatusCode: 200,
+			Body:       io.NopCloser(bytes.NewBufferString(`[{"item":1},{"item":2}]`)),
+			Header: http.Header{
+				"Content-Type": []string{"application/json"},
+				"Link":         []string{`<https://api.github.com/repositories/1227/issues?page=2>; rel="next", <https://api.github.com/repositories/1227/issues?page=4>; rel="last"`},
+			},
+		},
+		{
+			StatusCode: 200,
+			Body:       io.NopCloser(bytes.NewBufferString(`[{"item":3},{"item":4}]`)),
+			Header: http.Header{
+				"Content-Type": []string{"application/json"},
+				"Link":         []string{`<https://api.github.com/repositories/1227/issues?page=3>; rel="next", <https://api.github.com/repositories/1227/issues?page=4>; rel="last"`},
+			},
+		},
+		{
+			StatusCode: 200,
+			Body:       io.NopCloser(bytes.NewBufferString(`[{"item":5}]`)),
+			Header: http.Header{
+				"Content-Type": []string{"application/json"},
+				"Link":         []string{`<https://api.github.com/repositories/1227/issues?page=4>; rel="next", <https://api.github.com/repositories/1227/issues?page=4>; rel="last"`},
+			},
+		},
+		{
+			StatusCode: 200,
+			Body:       io.NopCloser(bytes.NewBufferString(`[]`)),
+			Header: http.Header{
+				"Content-Type": []string{"application/json"},
+			},
+		},
+	}
+
+	options := ApiOptions{
+		IO: ios,
+		HttpClient: func(rootapi.HTTPClientOptions) (*http.Client, error) {
+			var tr roundTripper = func(req *http.Request) (*http.Response, error) {
+				resp := responses[requestCount]
+				resp.Request = req
+				requestCount++
+				return resp, nil
+			}
+			return &http.Client{Transport: tr}, nil
+		},
+		Config: func() (gh.Config, error) {
+			return config.NewMockConfig(), nil
+		},
+
+		RequestMethod:       "GET",
+		RequestMethodPassed: true,
+		RequestPath:         "issues",
+		Paginate:            true,
+		RawFields:           []string{"per_page=50", "page=1"},
+	}
+
+	err := apiRun(&options)
+	assert.NoError(t, err)
+
+	assert.Equal(t, `[{"item":1},{"item":2},{"item":3},{"item":4},{"item":5} ]`, stdout.String(), "stdout")
+	assert.Equal(t, "", stderr.String(), "stderr")
+
+	assert.Equal(t, "https://api.github.com/issues?page=1&per_page=50", responses[0].Request.URL.String())
+	assert.Equal(t, "https://api.github.com/repositories/1227/issues?page=2", responses[1].Request.URL.String())
+	assert.Equal(t, "https://api.github.com/repositories/1227/issues?page=3", responses[2].Request.URL.String())
+}
+
+func Test_apiRun_arrayPaginationREST_with_headers(t *testing.T) {
+	ios, _, stdout, stderr := iostreams.Test()
+
+	requestCount := 0
+	responses := []*http.Response{
+		{
+			Proto:      "HTTP/1.1",
+			Status:     "200 OK",
+			StatusCode: 200,
+			Body:       io.NopCloser(bytes.NewBufferString(`[{"page":1}]`)),
+			Header: http.Header{
+				"Content-Type":        []string{"application/json"},
+				"Link":                []string{`<https://api.github.com/repositories/1227/issues?page=2>; rel="next", <https://api.github.com/repositories/1227/issues?page=3>; rel="last"`},
+				"X-Github-Request-Id": []string{"1"},
+			},
+		},
+		{
+			Proto:      "HTTP/1.1",
+			Status:     "200 OK",
+			StatusCode: 200,
+			Body:       io.NopCloser(bytes.NewBufferString(`[{"page":2}]`)),
+			Header: http.Header{
+				"Content-Type":        []string{"application/json"},
+				"Link":                []string{`<https://api.github.com/repositories/1227/issues?page=3>; rel="next", <https://api.github.com/repositories/1227/issues?page=3>; rel="last"`},
+				"X-Github-Request-Id": []string{"2"},
+			},
+		},
+		{
+			Proto:      "HTTP/1.1",
+			Status:     "200 OK",
+			StatusCode: 200,
+			Body:       io.NopCloser(bytes.NewBufferString(`[{"page":3}]`)),
+			Header: http.Header{
+				"Content-Type":        []string{"application/json"},
+				"X-Github-Request-Id": []string{"3"},
+			},
+		},
+	}
+
+	options := ApiOptions{
+		IO: ios,
+		HttpClient: func(rootapi.HTTPClientOptions) (*http.Client, error) {
+			var tr roundTripper = func(req *http.Request) (*http.Response, error) {
+				resp := responses[requestCount]
+				resp.Request = req
+				requestCount++
+				return resp, nil
+			}
+			return &http.Client{Transport: tr}, nil
+		},
+		Config: func() (gh.Config, error) {
+			return config.NewMockConfig(), nil
+		},
+
+		RequestMethod:       "GET",
+		RequestMethodPassed: true,
+		RequestPath:         "issues",
+		Paginate:            true,
+		RawFields:           []string{"per_page=50", "page=1"},
+		ShowResponseHeaders: true,
+	}
+
+	err := apiRun(&options)
+	assert.NoError(t, err)
+
+	assert.Equal(t, "HTTP/1.1 200 OK\nContent-Type: application/json\r\nLink: <https://api.github.com/repositories/1227/issues?page=2>; rel=\"next\", <https://api.github.com/repositories/1227/issues?page=3>; rel=\"last\"\r\nX-Github-Request-Id: 1\r\n\r\n[{\"page\":1}]\nHTTP/1.1 200 OK\nContent-Type: application/json\r\nLink: <https://api.github.com/repositories/1227/issues?page=3>; rel=\"next\", <https://api.github.com/repositories/1227/issues?page=3>; rel=\"last\"\r\nX-Github-Request-Id: 2\r\n\r\n[{\"page\":2}]\nHTTP/1.1 200 OK\nContent-Type: application/json\r\nX-Github-Request-Id: 3\r\n\r\n[{\"page\":3}]", stdout.String(), "stdout")
+	assert.Equal(t, "", stderr.String(), "stderr")
+
+	assert.Equal(t, "https://api.github.com/issues?page=1&per_page=50", responses[0].Request.URL.String())
 	assert.Equal(t, "https://api.github.com/repositories/1227/issues?page=2", responses[1].Request.URL.String())
 	assert.Equal(t, "https://api.github.com/repositories/1227/issues?page=3", responses[2].Request.URL.String())
 }
 
 func Test_apiRun_paginationGraphQL(t *testing.T) {
-	io, _, stdout, stderr := iostreams.Test()
+	ios, _, stdout, stderr := iostreams.Test()
 
 	requestCount := 0
 	responses := []*http.Response{
 		{
 			StatusCode: 200,
 			Header:     http.Header{"Content-Type": []string{`application/json`}},
-			Body: ioutil.NopCloser(bytes.NewBufferString(`{
+			Body: io.NopCloser(bytes.NewBufferString(heredoc.Doc(`
+			{
 				"data": {
 					"nodes": ["page one"],
+					"pageInfo": {
+						"endCursor": "PAGE1_END",
+						"hasNextPage": true
+					}
+				}
+			}`))),
+		},
+		{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{`application/json`}},
+			Body: io.NopCloser(bytes.NewBufferString(heredoc.Doc(`
+			{
+				"data": {
+					"nodes": ["page two"],
+					"pageInfo": {
+						"endCursor": "PAGE2_END",
+						"hasNextPage": false
+					}
+				}
+			}`))),
+		},
+	}
+
+	options := ApiOptions{
+		IO: ios,
+		HttpClient: func(rootapi.HTTPClientOptions) (*http.Client, error) {
+			var tr roundTripper = func(req *http.Request) (*http.Response, error) {
+				resp := responses[requestCount]
+				resp.Request = req
+				requestCount++
+				return resp, nil
+			}
+			return &http.Client{Transport: tr}, nil
+		},
+		Config: func() (gh.Config, error) {
+			return config.NewMockConfig(), nil
+		},
+
+		RawFields:     []string{"foo=bar"},
+		RequestMethod: "POST",
+		RequestPath:   "graphql",
+		Paginate:      true,
+	}
+
+	err := apiRun(&options)
+	require.NoError(t, err)
+
+	assert.Equal(t, heredoc.Doc(`
+	{
+		"data": {
+			"nodes": ["page one"],
+			"pageInfo": {
+				"endCursor": "PAGE1_END",
+				"hasNextPage": true
+			}
+		}
+	}{
+		"data": {
+			"nodes": ["page two"],
+			"pageInfo": {
+				"endCursor": "PAGE2_END",
+				"hasNextPage": false
+			}
+		}
+	}`), stdout.String())
+	assert.Equal(t, "", stderr.String(), "stderr")
+
+	var requestData struct {
+		Variables map[string]any
+	}
+
+	bb, err := io.ReadAll(responses[0].Request.Body)
+	require.NoError(t, err)
+	err = json.Unmarshal(bb, &requestData)
+	require.NoError(t, err)
+	_, hasCursor := requestData.Variables["endCursor"].(string)
+	assert.Equal(t, false, hasCursor)
+
+	bb, err = io.ReadAll(responses[1].Request.Body)
+	require.NoError(t, err)
+	err = json.Unmarshal(bb, &requestData)
+	require.NoError(t, err)
+	endCursor, hasCursor := requestData.Variables["endCursor"].(string)
+	assert.Equal(t, true, hasCursor)
+	assert.Equal(t, "PAGE1_END", endCursor)
+}
+
+func Test_apiRun_paginationGraphQL_slurp(t *testing.T) {
+	ios, _, stdout, stderr := iostreams.Test()
+
+	requestCount := 0
+	responses := []*http.Response{
+		{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{`application/json`}},
+			Body: io.NopCloser(bytes.NewBufferString(heredoc.Doc(`
+			{
+				"data": {
+					"nodes": ["page one"],
+					"pageInfo": {
+						"endCursor": "PAGE1_END",
+						"hasNextPage": true
+					}
+				}
+			}`))),
+		},
+		{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{`application/json`}},
+			Body: io.NopCloser(bytes.NewBufferString(heredoc.Doc(`
+			{
+				"data": {
+					"nodes": ["page two"],
+					"pageInfo": {
+						"endCursor": "PAGE2_END",
+						"hasNextPage": false
+					}
+				}
+			}`))),
+		},
+	}
+
+	options := ApiOptions{
+		IO: ios,
+		HttpClient: func(rootapi.HTTPClientOptions) (*http.Client, error) {
+			var tr roundTripper = func(req *http.Request) (*http.Response, error) {
+				resp := responses[requestCount]
+				resp.Request = req
+				requestCount++
+				return resp, nil
+			}
+			return &http.Client{Transport: tr}, nil
+		},
+		Config: func() (gh.Config, error) {
+			return config.NewMockConfig(), nil
+		},
+
+		RawFields:     []string{"foo=bar"},
+		RequestMethod: "POST",
+		RequestPath:   "graphql",
+		Paginate:      true,
+		Slurp:         true,
+	}
+
+	err := apiRun(&options)
+	require.NoError(t, err)
+
+	assert.JSONEq(t, stdout.String(), `[
+		{
+			"data": {
+				"nodes": ["page one"],
+				"pageInfo": {
+					"endCursor": "PAGE1_END",
+					"hasNextPage": true
+				}
+			}
+		},
+		{
+
+			"data": {
+				"nodes": ["page two"],
+				"pageInfo": {
+					"endCursor": "PAGE2_END",
+					"hasNextPage": false
+				}
+			}
+		}
+	]`)
+	assert.Equal(t, "", stderr.String(), "stderr")
+
+	var requestData struct {
+		Variables map[string]any
+	}
+
+	bb, err := io.ReadAll(responses[0].Request.Body)
+	require.NoError(t, err)
+	err = json.Unmarshal(bb, &requestData)
+	require.NoError(t, err)
+	_, hasCursor := requestData.Variables["endCursor"].(string)
+	assert.Equal(t, false, hasCursor)
+
+	bb, err = io.ReadAll(responses[1].Request.Body)
+	require.NoError(t, err)
+	err = json.Unmarshal(bb, &requestData)
+	require.NoError(t, err)
+	endCursor, hasCursor := requestData.Variables["endCursor"].(string)
+	assert.Equal(t, true, hasCursor)
+	assert.Equal(t, "PAGE1_END", endCursor)
+}
+
+func Test_apiRun_paginated_template(t *testing.T) {
+	ios, _, stdout, stderr := iostreams.Test()
+	ios.SetStdoutTTY(true)
+
+	requestCount := 0
+	responses := []*http.Response{
+		{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{`application/json`}},
+			Body: io.NopCloser(bytes.NewBufferString(`{
+				"data": {
+					"nodes": [
+						{
+							"page": 1,
+							"caption": "page one"
+						}
+					],
 					"pageInfo": {
 						"endCursor": "PAGE1_END",
 						"hasNextPage": true
@@ -612,11 +1247,16 @@ func Test_apiRun_paginationGraphQL(t *testing.T) {
 		{
 			StatusCode: 200,
 			Header:     http.Header{"Content-Type": []string{`application/json`}},
-			Body: ioutil.NopCloser(bytes.NewBufferString(`{
+			Body: io.NopCloser(bytes.NewBufferString(`{
 				"data": {
-					"nodes": ["page two"],
+					"nodes": [
+						{
+							"page": 20,
+							"caption": "page twenty"
+						}
+					],
 					"pageInfo": {
-						"endCursor": "PAGE2_END",
+						"endCursor": "PAGE20_END",
 						"hasNextPage": false
 					}
 				}
@@ -625,8 +1265,8 @@ func Test_apiRun_paginationGraphQL(t *testing.T) {
 	}
 
 	options := ApiOptions{
-		IO: io,
-		HttpClient: func() (*http.Client, error) {
+		IO: ios,
+		HttpClient: func(rootapi.HTTPClientOptions) (*http.Client, error) {
 			var tr roundTripper = func(req *http.Request) (*http.Response, error) {
 				resp := responses[requestCount]
 				resp.Request = req
@@ -635,40 +1275,104 @@ func Test_apiRun_paginationGraphQL(t *testing.T) {
 			}
 			return &http.Client{Transport: tr}, nil
 		},
-		Config: func() (config.Config, error) {
-			return config.NewBlankConfig(), nil
+		Config: func() (gh.Config, error) {
+			return config.NewMockConfig(), nil
 		},
 
 		RequestMethod: "POST",
 		RequestPath:   "graphql",
+		RawFields:     []string{"foo=bar"},
 		Paginate:      true,
+		// test that templates executed per page properly render a table.
+		Template: `{{range .data.nodes}}{{tablerow .page .caption}}{{end}}`,
 	}
 
 	err := apiRun(&options)
 	require.NoError(t, err)
 
-	assert.Contains(t, stdout.String(), `"page one"`)
-	assert.Contains(t, stdout.String(), `"page two"`)
+	assert.Equal(t, heredoc.Doc(`
+	1   page one
+	20  page twenty
+	`), stdout.String(), "stdout")
 	assert.Equal(t, "", stderr.String(), "stderr")
 
 	var requestData struct {
-		Variables map[string]interface{}
+		Variables map[string]any
 	}
 
-	bb, err := ioutil.ReadAll(responses[0].Request.Body)
+	bb, err := io.ReadAll(responses[0].Request.Body)
 	require.NoError(t, err)
 	err = json.Unmarshal(bb, &requestData)
 	require.NoError(t, err)
 	_, hasCursor := requestData.Variables["endCursor"].(string)
 	assert.Equal(t, false, hasCursor)
 
-	bb, err = ioutil.ReadAll(responses[1].Request.Body)
+	bb, err = io.ReadAll(responses[1].Request.Body)
 	require.NoError(t, err)
 	err = json.Unmarshal(bb, &requestData)
 	require.NoError(t, err)
 	endCursor, hasCursor := requestData.Variables["endCursor"].(string)
 	assert.Equal(t, true, hasCursor)
 	assert.Equal(t, "PAGE1_END", endCursor)
+}
+
+func Test_apiRun_DELETE(t *testing.T) {
+	ios, _, _, _ := iostreams.Test()
+
+	var gotRequest *http.Request
+	err := apiRun(&ApiOptions{
+		IO: ios,
+		Config: func() (gh.Config, error) {
+			return config.NewMockConfig(), nil
+		},
+		HttpClient: func(rootapi.HTTPClientOptions) (*http.Client, error) {
+			var tr roundTripper = func(req *http.Request) (*http.Response, error) {
+				gotRequest = req
+				return &http.Response{StatusCode: 204, Request: req}, nil
+			}
+			return &http.Client{Transport: tr}, nil
+		},
+		MagicFields:         []string(nil),
+		RawFields:           []string(nil),
+		RequestMethod:       "DELETE",
+		RequestMethodPassed: true,
+	})
+	if err != nil {
+		t.Fatalf("got error %v", err)
+	}
+
+	if gotRequest.Body != nil {
+		t.Errorf("expected nil request body, got %T", gotRequest.Body)
+	}
+}
+
+func Test_apiRun_HEAD(t *testing.T) {
+	ios, _, _, _ := iostreams.Test()
+
+	err := apiRun(&ApiOptions{
+		IO: ios,
+		Config: func() (gh.Config, error) {
+			return config.NewMockConfig(), nil
+		},
+		HttpClient: func(rootapi.HTTPClientOptions) (*http.Client, error) {
+			var tr roundTripper = func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: 422,
+					Request:    req,
+					Header: map[string][]string{
+						"Content-Type": {"application/json"},
+					}}, nil
+			}
+			return &http.Client{Transport: tr}, nil
+		},
+		MagicFields:         []string(nil),
+		RawFields:           []string(nil),
+		RequestMethod:       "HEAD",
+		RequestMethodPassed: true,
+	})
+	if err != cmdutil.SilentError {
+		t.Fatalf("got error %v", err)
+	}
 }
 
 func Test_apiRun_inputFile(t *testing.T) {
@@ -693,22 +1397,24 @@ func Test_apiRun_inputFile(t *testing.T) {
 			contentLength: 10,
 		},
 	}
+
+	tempDir := t.TempDir()
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			io, stdin, _, _ := iostreams.Test()
+			ios, stdin, _, _ := iostreams.Test()
 			resp := &http.Response{StatusCode: 204}
 
 			inputFile := tt.inputFile
 			if tt.inputFile == "-" {
 				_, _ = stdin.Write(tt.inputContents)
 			} else {
-				f, err := ioutil.TempFile("", tt.inputFile)
+				f, err := os.CreateTemp(tempDir, tt.inputFile)
 				if err != nil {
 					t.Fatal(err)
 				}
 				_, _ = f.Write(tt.inputContents)
-				f.Close()
-				t.Cleanup(func() { os.Remove(f.Name()) })
+				defer f.Close()
 				inputFile = f.Name()
 			}
 
@@ -718,11 +1424,11 @@ func Test_apiRun_inputFile(t *testing.T) {
 				RequestInputFile: inputFile,
 				RawFields:        []string{"a=b", "c=d"},
 
-				IO: io,
-				HttpClient: func() (*http.Client, error) {
+				IO: ios,
+				HttpClient: func(rootapi.HTTPClientOptions) (*http.Client, error) {
 					var tr roundTripper = func(req *http.Request) (*http.Response, error) {
 						var err error
-						if bodyBytes, err = ioutil.ReadAll(req.Body); err != nil {
+						if bodyBytes, err = io.ReadAll(req.Body); err != nil {
 							return nil, err
 						}
 						resp.Request = req
@@ -730,8 +1436,8 @@ func Test_apiRun_inputFile(t *testing.T) {
 					}
 					return &http.Client{Transport: tr}, nil
 				},
-				Config: func() (config.Config, error) {
-					return config.NewBlankConfig(), nil
+				Config: func() (gh.Config, error) {
+					return config.NewMockConfig(), nil
 				},
 			}
 
@@ -750,181 +1456,88 @@ func Test_apiRun_inputFile(t *testing.T) {
 }
 
 func Test_apiRun_cache(t *testing.T) {
-	io, _, stdout, stderr := iostreams.Test()
-
+	// Given we have a test server that spies on the number of requests it receives
 	requestCount := 0
-	options := ApiOptions{
-		IO: io,
-		HttpClient: func() (*http.Client, error) {
-			var tr roundTripper = func(req *http.Request) (*http.Response, error) {
-				requestCount++
-				return &http.Response{
-					Request:    req,
-					StatusCode: 204,
-				}, nil
-			}
-			return &http.Client{Transport: tr}, nil
-		},
-		Config: func() (config.Config, error) {
-			return config.NewBlankConfig(), nil
-		},
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(s.Close)
 
-		RequestPath: "issues",
+	ios, _, stdout, stderr := iostreams.Test()
+	options := ApiOptions{
+		IO: ios,
+		Config: func() (gh.Config, error) {
+			return &ghmock.ConfigMock{
+				AuthenticationFunc: func() gh.AuthConfig {
+					cfg := &config.AuthConfig{}
+					// Required because the http client tries to get the active token and otherwise
+					// this goes down to go-gh config and panics. Pretty bad solution, it would
+					// be better if this were black box.
+					cfg.SetActiveToken("token", "stub")
+					return cfg
+				},
+				// Cached responses are stored in a tempdir that gets automatically cleaned up
+				CacheDirFunc: func() string {
+					return t.TempDir()
+				},
+			}, nil
+		},
+		// You might think that we want to set Host: s.URL here, but you'd be wrong.
+		// The host field is later used to evaluate an API URL e.g. https://api.host.com/graphql
+		// The RequestPath field is used exactly as is, for the request if it includes a host.
+		RequestPath: s.URL,
 		CacheTTL:    time.Minute,
 	}
 
-	t.Cleanup(func() {
-		cacheDir := filepath.Join(os.TempDir(), "gh-cli-cache")
-		os.RemoveAll(cacheDir)
-	})
+	// When we run the API behaviour twice
+	require.NoError(t, apiRun(&options))
+	require.NoError(t, apiRun(&options))
 
-	err := apiRun(&options)
-	assert.NoError(t, err)
-	err = apiRun(&options)
-	assert.NoError(t, err)
-
+	// We only get one request to the http server because it uses the cached response
 	assert.Equal(t, 1, requestCount)
 	assert.Equal(t, "", stdout.String(), "stdout")
 	assert.Equal(t, "", stderr.String(), "stderr")
 }
 
-func Test_parseFields(t *testing.T) {
-	io, stdin, _, _ := iostreams.Test()
-	fmt.Fprint(stdin, "pasted contents")
+func Test_apiRun_invokingAgent(t *testing.T) {
+	var receivedUA string
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedUA = r.Header.Get("User-Agent")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(s.Close)
 
-	opts := ApiOptions{
-		IO: io,
-		RawFields: []string{
-			"robot=Hubot",
-			"destroyer=false",
-			"helper=true",
-			"location=@work",
-		},
-		MagicFields: []string{
-			"input=@-",
-			"enabled=true",
-			"victories=123",
-		},
-	}
-
-	params, err := parseFields(&opts)
-	if err != nil {
-		t.Fatalf("parseFields error: %v", err)
-	}
-
-	expect := map[string]interface{}{
-		"robot":     "Hubot",
-		"destroyer": "false",
-		"helper":    "true",
-		"location":  "@work",
-		"input":     []byte("pasted contents"),
-		"enabled":   true,
-		"victories": 123,
-	}
-	assert.Equal(t, expect, params)
-}
-
-func Test_magicFieldValue(t *testing.T) {
-	f, err := ioutil.TempFile("", "gh-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	fmt.Fprint(f, "file contents")
-	f.Close()
-	t.Cleanup(func() { os.Remove(f.Name()) })
-
-	io, _, _, _ := iostreams.Test()
-
-	type args struct {
-		v    string
-		opts *ApiOptions
-	}
-	tests := []struct {
-		name    string
-		args    args
-		want    interface{}
-		wantErr bool
-	}{
-		{
-			name:    "string",
-			args:    args{v: "hello"},
-			want:    "hello",
-			wantErr: false,
-		},
-		{
-			name:    "bool true",
-			args:    args{v: "true"},
-			want:    true,
-			wantErr: false,
-		},
-		{
-			name:    "bool false",
-			args:    args{v: "false"},
-			want:    false,
-			wantErr: false,
-		},
-		{
-			name:    "null",
-			args:    args{v: "null"},
-			want:    nil,
-			wantErr: false,
-		},
-		{
-			name: "placeholder",
-			args: args{
-				v: ":owner",
-				opts: &ApiOptions{
-					IO: io,
-					BaseRepo: func() (ghrepo.Interface, error) {
-						return ghrepo.New("hubot", "robot-uprising"), nil
-					},
+	ios, _, _, _ := iostreams.Test()
+	options := ApiOptions{
+		IO:            ios,
+		AppVersion:    "1.2.3",
+		InvokingAgent: "copilot-cli",
+		Config: func() (gh.Config, error) {
+			return &ghmock.ConfigMock{
+				AuthenticationFunc: func() gh.AuthConfig {
+					cfg := &config.AuthConfig{}
+					cfg.SetActiveToken("token", "stub")
+					return cfg
 				},
-			},
-			want:    "hubot",
-			wantErr: false,
+			}, nil
 		},
-		{
-			name: "file",
-			args: args{
-				v:    "@" + f.Name(),
-				opts: &ApiOptions{IO: io},
-			},
-			want:    []byte("file contents"),
-			wantErr: false,
-		},
-		{
-			name: "file error",
-			args: args{
-				v:    "@",
-				opts: &ApiOptions{IO: io},
-			},
-			want:    nil,
-			wantErr: true,
-		},
+		RequestPath: s.URL,
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := magicFieldValue(tt.args.v, tt.args.opts)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("magicFieldValue() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if tt.wantErr {
-				return
-			}
-			assert.Equal(t, tt.want, got)
-		})
-	}
+
+	require.NoError(t, apiRun(&options))
+	assert.Contains(t, receivedUA, "GitHub CLI 1.2.3")
+	assert.Contains(t, receivedUA, "Agent/copilot-cli")
 }
 
 func Test_openUserFile(t *testing.T) {
-	f, err := ioutil.TempFile("", "gh-test")
+	f, err := os.CreateTemp(t.TempDir(), "gh-test")
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer f.Close()
+
 	fmt.Fprint(f, "file contents")
-	f.Close()
-	t.Cleanup(func() { os.Remove(f.Name()) })
 
 	file, length, err := openUserFile(f.Name(), nil)
 	if err != nil {
@@ -932,7 +1545,7 @@ func Test_openUserFile(t *testing.T) {
 	}
 	defer file.Close()
 
-	fb, err := ioutil.ReadAll(file)
+	fb, err := io.ReadAll(file)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -947,10 +1560,11 @@ func Test_fillPlaceholders(t *testing.T) {
 		opts  *ApiOptions
 	}
 	tests := []struct {
-		name    string
-		args    args
-		want    string
-		wantErr bool
+		name         string
+		args         args
+		repoOverride bool
+		want         string
+		wantErr      bool
 	}{
 		{
 			name: "no changes",
@@ -964,7 +1578,7 @@ func Test_fillPlaceholders(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "has substitutes",
+			name: "has substitutes (colon)",
 			args: args{
 				value: "repos/:owner/:repo/releases",
 				opts: &ApiOptions{
@@ -977,39 +1591,96 @@ func Test_fillPlaceholders(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "has branch placeholder",
+			name: "has branch placeholder (colon)",
 			args: args{
-				value: "repos/cli/cli/branches/:branch/protection/required_status_checks",
+				value: "repos/owner/repo/branches/:branch/protection/required_status_checks",
 				opts: &ApiOptions{
-					BaseRepo: func() (ghrepo.Interface, error) {
-						return ghrepo.New("cli", "cli"), nil
-					},
+					BaseRepo: nil,
 					Branch: func() (string, error) {
 						return "trunk", nil
 					},
 				},
 			},
-			want:    "repos/cli/cli/branches/trunk/protection/required_status_checks",
+			want:    "repos/owner/repo/branches/trunk/protection/required_status_checks",
 			wantErr: false,
 		},
 		{
-			name: "has branch placeholder and git is in detached head",
+			name: "has branch placeholder and git is in detached head (colon)",
 			args: args{
 				value: "repos/:owner/:repo/branches/:branch",
 				opts: &ApiOptions{
 					BaseRepo: func() (ghrepo.Interface, error) {
-						return ghrepo.New("cli", "cli"), nil
+						return ghrepo.New("hubot", "robot-uprising"), nil
 					},
 					Branch: func() (string, error) {
 						return "", git.ErrNotOnAnyBranch
 					},
 				},
 			},
-			want:    "repos/:owner/:repo/branches/:branch",
+			want:    "repos/hubot/robot-uprising/branches/:branch",
 			wantErr: true,
 		},
 		{
-			name: "no greedy substitutes",
+			name: "has substitutes",
+			args: args{
+				value: "repos/{owner}/{repo}/releases",
+				opts: &ApiOptions{
+					BaseRepo: func() (ghrepo.Interface, error) {
+						return ghrepo.New("hubot", "robot-uprising"), nil
+					},
+				},
+			},
+			want:    "repos/hubot/robot-uprising/releases",
+			wantErr: false,
+		},
+		{
+			name: "has branch placeholder",
+			args: args{
+				value: "repos/owner/repo/branches/{branch}/protection/required_status_checks",
+				opts: &ApiOptions{
+					BaseRepo: nil,
+					Branch: func() (string, error) {
+						return "trunk", nil
+					},
+				},
+			},
+			want:    "repos/owner/repo/branches/trunk/protection/required_status_checks",
+			wantErr: false,
+		},
+		{
+			name: "has branch placeholder and git is in detached head",
+			args: args{
+				value: "repos/{owner}/{repo}/branches/{branch}",
+				opts: &ApiOptions{
+					BaseRepo: func() (ghrepo.Interface, error) {
+						return ghrepo.New("hubot", "robot-uprising"), nil
+					},
+					Branch: func() (string, error) {
+						return "", git.ErrNotOnAnyBranch
+					},
+				},
+			},
+			want:    "repos/hubot/robot-uprising/branches/{branch}",
+			wantErr: true,
+		},
+		{
+			name: "surfaces errors in earlier placeholders",
+			args: args{
+				value: "{branch}-{owner}",
+				opts: &ApiOptions{
+					BaseRepo: func() (ghrepo.Interface, error) {
+						return ghrepo.New("hubot", "robot-uprising"), nil
+					},
+					Branch: func() (string, error) {
+						return "", git.ErrNotOnAnyBranch
+					},
+				},
+			},
+			want:    "{branch}-hubot",
+			wantErr: true,
+		},
+		{
+			name: "no greedy substitutes (colon)",
 			args: args{
 				value: ":ownership/:repository",
 				opts: &ApiOptions{
@@ -1019,9 +1690,37 @@ func Test_fillPlaceholders(t *testing.T) {
 			want:    ":ownership/:repository",
 			wantErr: false,
 		},
+		{
+			name: "non-placeholders are left intact",
+			args: args{
+				value: "{}{ownership}/{repository}",
+				opts: &ApiOptions{
+					BaseRepo: nil,
+				},
+			},
+			want:    "{}{ownership}/{repository}",
+			wantErr: false,
+		},
+		{
+			name:         "branch can't be filled when GH_REPO is set",
+			repoOverride: true,
+			args: args{
+				value: "repos/:owner/:repo/branches/:branch",
+				opts: &ApiOptions{
+					BaseRepo: func() (ghrepo.Interface, error) {
+						return ghrepo.New("hubot", "robot-uprising"), nil
+					},
+				},
+			},
+			want:    "repos/hubot/robot-uprising/branches/:branch",
+			wantErr: true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			if tt.repoOverride {
+				t.Setenv("GH_REPO", "hubot/robot-uprising")
+			}
 			got, err := fillPlaceholders(tt.args.value, tt.args.opts)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("fillPlaceholders() error = %v, wantErr %v", err, tt.wantErr)
@@ -1061,14 +1760,14 @@ func Test_previewNamesToMIMETypes(t *testing.T) {
 }
 
 func Test_processResponse_template(t *testing.T) {
-	io, _, stdout, stderr := iostreams.Test()
+	ios, _, stdout, stderr := iostreams.Test()
 
 	resp := http.Response{
 		StatusCode: 200,
 		Header: map[string][]string{
 			"Content-Type": {"application/json"},
 		},
-		Body: ioutil.NopCloser(strings.NewReader(`[
+		Body: io.NopCloser(strings.NewReader(`[
 			{
 				"title": "First title",
 				"labels": [{"name":"bug"}, {"name":"help wanted"}]
@@ -1083,10 +1782,17 @@ func Test_processResponse_template(t *testing.T) {
 		]`)),
 	}
 
-	_, err := processResponse(&resp, &ApiOptions{
-		IO:       io,
+	opts := ApiOptions{
+		IO:       ios,
 		Template: `{{range .}}{{.title}} ({{.labels | pluck "name" | join ", " }}){{"\n"}}{{end}}`,
-	}, ioutil.Discard)
+	}
+
+	tmpl := template.New(ios.Out, ios.TerminalWidth(), ios.ColorEnabled())
+	err := tmpl.Parse(opts.Template)
+	require.NoError(t, err)
+	_, err = processResponse(&resp, &opts, ios.Out, io.Discard, tmpl, true, true)
+	require.NoError(t, err)
+	err = tmpl.Flush()
 	require.NoError(t, err)
 
 	assert.Equal(t, heredoc.Doc(`
@@ -1095,4 +1801,141 @@ func Test_processResponse_template(t *testing.T) {
 		Alas, tis' the end (, feature)
 	`), stdout.String())
 	assert.Equal(t, "", stderr.String())
+}
+
+func Test_parseErrorResponse(t *testing.T) {
+	type args struct {
+		input      string
+		statusCode int
+	}
+	tests := []struct {
+		name       string
+		args       args
+		wantErrMsg string
+		wantErr    bool
+	}{
+		{
+			name: "no error",
+			args: args{
+				input:      `{}`,
+				statusCode: 500,
+			},
+			wantErrMsg: "",
+			wantErr:    false,
+		},
+		{
+			name: "nil errors",
+			args: args{
+				input:      `{"errors":null}`,
+				statusCode: 500,
+			},
+			wantErrMsg: "",
+			wantErr:    false,
+		},
+		{
+			name: "simple error",
+			args: args{
+				input:      `{"message": "OH NOES"}`,
+				statusCode: 500,
+			},
+			wantErrMsg: "OH NOES (HTTP 500)",
+			wantErr:    false,
+		},
+		{
+			name: "errors string",
+			args: args{
+				input:      `{"message": "Conflict", "errors": "Some description"}`,
+				statusCode: 409,
+			},
+			wantErrMsg: "Some description (Conflict)",
+			wantErr:    false,
+		},
+		{
+			name: "errors array of strings",
+			args: args{
+				input:      `{"errors": ["fail1", "asplode2"]}`,
+				statusCode: 500,
+			},
+			wantErrMsg: "fail1\nasplode2",
+			wantErr:    false,
+		},
+		{
+			name: "errors array of objects",
+			args: args{
+				input:      `{"errors": [{"message":"fail1"}, {"message":"asplode2"}]}`,
+				statusCode: 500,
+			},
+			wantErrMsg: "fail1\nasplode2",
+			wantErr:    false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, got1, err := parseErrorResponse(strings.NewReader(tt.args.input), tt.args.statusCode)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("parseErrorResponse() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if gotString, _ := io.ReadAll(got); tt.args.input != string(gotString) {
+				t.Errorf("parseErrorResponse() got = %q, want %q", string(gotString), tt.args.input)
+			}
+			if got1 != tt.wantErrMsg {
+				t.Errorf("parseErrorResponse() got1 = %q, want %q", got1, tt.wantErrMsg)
+			}
+		})
+	}
+}
+
+func Test_apiRun_acceptHeader(t *testing.T) {
+	tests := []struct {
+		name             string
+		options          ApiOptions
+		wantAcceptHeader string
+	}{
+		{
+			name:             "sets default accept header",
+			options:          ApiOptions{},
+			wantAcceptHeader: "*/*",
+		},
+		{
+			name: "does not override user accept header",
+			options: ApiOptions{
+				RequestHeaders: []string{"Accept: testing"},
+			},
+			wantAcceptHeader: "testing",
+		},
+		{
+			name: "does not override preview names",
+			options: ApiOptions{
+				Previews: []string{"nebula"},
+			},
+			wantAcceptHeader: "application/vnd.github.nebula-preview+json",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ios, _, _, _ := iostreams.Test()
+			tt.options.IO = ios
+
+			tt.options.Config = func() (gh.Config, error) {
+				return config.NewMockConfig(), nil
+			}
+
+			var gotReq *http.Request
+			tt.options.HttpClient = func(rootapi.HTTPClientOptions) (*http.Client, error) {
+				var tr roundTripper = func(req *http.Request) (*http.Response, error) {
+					gotReq = req
+					resp := &http.Response{
+						StatusCode: 200,
+						Request:    req,
+						Body:       io.NopCloser(bytes.NewBufferString("")),
+					}
+					return resp, nil
+				}
+				return &http.Client{Transport: tr}, nil
+			}
+
+			assert.NoError(t, apiRun(&tt.options))
+			assert.Equal(t, tt.wantAcceptHeader, gotReq.Header.Get("Accept"))
+		})
+	}
 }

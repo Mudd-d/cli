@@ -12,6 +12,7 @@
 //     - GH_OAUTH_CLIENT_SECRET
 //     - SOURCE_DATE_EPOCH: enables reproducible builds
 //     - GO_LDFLAGS
+//     - GO_BUILDTAGS: rebuilds an up to date binary if it was built with different tags
 //
 //   manpages:
 //     Builds the man pages under `share/man/man1/`.
@@ -23,12 +24,15 @@
 package main
 
 import (
+	"debug/buildinfo"
+	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -38,21 +42,29 @@ import (
 
 var tasks = map[string]func(string) error{
 	"bin/gh": func(exe string) error {
+		buildTags, _ := os.LookupEnv("GO_BUILDTAGS")
+
 		info, err := os.Stat(exe)
-		if err == nil && !sourceFilesLaterThan(info.ModTime()) {
+		if err == nil && !sourceFilesLaterThan(info.ModTime()) && builtWithTags(exe, buildTags) {
 			fmt.Printf("%s: `%s` is up to date.\n", self, exe)
 			return nil
 		}
 
 		ldflags := os.Getenv("GO_LDFLAGS")
-		ldflags = fmt.Sprintf("-X github.com/cli/cli/internal/build.Version=%s %s", version(), ldflags)
-		ldflags = fmt.Sprintf("-X github.com/cli/cli/internal/build.Date=%s %s", date(), ldflags)
+		ldflags = fmt.Sprintf("-X github.com/cli/cli/v2/internal/build.Version=%s %s", version(), ldflags)
+		ldflags = fmt.Sprintf("-X github.com/cli/cli/v2/internal/build.Date=%s %s", date(), ldflags)
 		if oauthSecret := os.Getenv("GH_OAUTH_CLIENT_SECRET"); oauthSecret != "" {
-			ldflags = fmt.Sprintf("-X github.com/cli/cli/internal/authflow.oauthClientSecret=%s %s", oauthSecret, ldflags)
-			ldflags = fmt.Sprintf("-X github.com/cli/cli/internal/authflow.oauthClientID=%s %s", os.Getenv("GH_OAUTH_CLIENT_ID"), ldflags)
+			ldflags = fmt.Sprintf("-X github.com/cli/cli/v2/internal/authflow.oauthClientSecret=%s %s", oauthSecret, ldflags)
+			ldflags = fmt.Sprintf("-X github.com/cli/cli/v2/internal/authflow.oauthClientID=%s %s", os.Getenv("GH_OAUTH_CLIENT_ID"), ldflags)
 		}
 
-		return run("go", "build", "-trimpath", "-ldflags", ldflags, "-o", exe, "./cmd/gh")
+		args := []string{"go", "build", "-trimpath"}
+		if buildTags != "" {
+			args = append(args, "-tags", buildTags)
+		}
+		args = append(args, "-ldflags", ldflags, "-o", exe, "./cmd/gh")
+
+		return run(args...)
 	},
 	"manpages": func(_ string) error {
 		return run("go", "run", "./cmd/gen-docs", "--man-page", "--doc-path", "./share/man/man1/")
@@ -103,6 +115,29 @@ func main() {
 	}
 }
 
+// builtWithTags reports whether the binary at exe was built with the given build tags, so switching tags (for
+// example between `make debug` and `make`) forces a rebuild even when sources have not changed.
+func builtWithTags(exe, tags string) bool {
+	info, err := buildinfo.ReadFile(exe)
+	if err != nil {
+		return false
+	}
+	var builtTags string
+	for _, s := range info.Settings {
+		if s.Key == "-tags" {
+			builtTags = s.Value
+			break
+		}
+	}
+	return normalizeBuildTags(builtTags) == normalizeBuildTags(tags)
+}
+
+func normalizeBuildTags(tags string) string {
+	fields := strings.FieldsFunc(tags, func(r rune) bool { return r == ',' || r == ' ' })
+	slices.Sort(fields)
+	return strings.Join(slices.Compact(fields), ",")
+}
+
 func isWindowsTarget() bool {
 	if os.Getenv("GOOS") == "windows" {
 		return true
@@ -136,8 +171,14 @@ func date() string {
 
 func sourceFilesLaterThan(t time.Time) bool {
 	foundLater := false
-	_ = filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
+	err := filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
 		if err != nil {
+			// Ignore errors that occur when the project contains a symlink to a filesystem or volume that
+			// Windows doesn't have access to.
+			if path != "." && isAccessDenied(err) {
+				fmt.Fprintf(os.Stderr, "%s: %v\n", path, err)
+				return nil
+			}
 			return err
 		}
 		if foundLater {
@@ -151,6 +192,9 @@ func sourceFilesLaterThan(t time.Time) bool {
 			}
 		}
 		if info.IsDir() {
+			if name := filepath.Base(path); name == "vendor" || name == "node_modules" {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		if path == "go.mod" || path == "go.sum" || (strings.HasSuffix(path, ".go") && !strings.HasSuffix(path, "_test.go")) {
@@ -160,7 +204,16 @@ func sourceFilesLaterThan(t time.Time) bool {
 		}
 		return nil
 	})
+	if err != nil {
+		panic(err)
+	}
 	return foundLater
+}
+
+func isAccessDenied(err error) bool {
+	var pe *os.PathError
+	// we would use `syscall.ERROR_ACCESS_DENIED` if this script supported build tags
+	return errors.As(err, &pe) && strings.Contains(pe.Err.Error(), "Access is denied")
 }
 
 func rmrf(targets ...string) error {
@@ -196,7 +249,7 @@ func cmdOutput(args ...string) (string, error) {
 		return "", err
 	}
 	cmd := exec.Command(exe, args[1:]...)
-	cmd.Stderr = ioutil.Discard
+	cmd.Stderr = io.Discard
 	out, err := cmd.Output()
 	return strings.TrimSuffix(string(out), "\n"), err
 }
